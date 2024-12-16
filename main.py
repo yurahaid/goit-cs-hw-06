@@ -1,9 +1,14 @@
+import multiprocessing
 import mimetypes
 import os
 import pathlib
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.parse
-from threading import Thread
+import socket
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 class HttpHandler(BaseHTTPRequestHandler):
@@ -36,19 +41,46 @@ class HttpHandler(BaseHTTPRequestHandler):
             self.wfile.write(file.read())
 
 
-def run(server_class=HTTPServer, handler_class=HttpHandler):
-    server_address = ('', int(os.environ.get('HTTP_PORT', 8000)))
-    http = server_class(server_address, handler_class)
+def run_udp_server(ip, port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server = ip, port
+    sock.bind(server)
+    try:
+        print("Udp server started on ip: ", ip, " port: ", port)
+        while True:
+            data, address = sock.recvfrom(1024)
+            print(f'Received data: {data.decode()} from: {address}')
+            sock.sendto(data, address)
+            print(f'Send data: {data.decode()} to: {address}')
 
-    def serve():
-        try:
-            http.serve_forever()
-        except KeyboardInterrupt:
-            http.server_close()
+    except KeyboardInterrupt:
+        print(f'Destroy server')
+    finally:
+        sock.close()
 
-    thread = Thread(target=serve)
-    thread.start()
+
+def run_http_server(port):
+    server_address = ('', port)
+    http = HTTPServer(server_address, HttpHandler)
+
+    try:
+        print(f'Http server started on port: {port}')
+        http.serve_forever()
+    except KeyboardInterrupt:
+        http.server_close()
 
 
 if __name__ == '__main__':
-    run()
+    http_process = multiprocessing.Process(
+        target=run_http_server,
+        args=(int(os.environ.get('HTTP_PORT', 8000)),)
+    )
+    udp_process = multiprocessing.Process(
+        target=run_udp_server,
+        args=(os.environ.get('UDP_IP', '127.0.0.1'), int(os.environ.get('UDP_PORT', 5000)))
+    )
+
+    http_process.start()
+    udp_process.start()
+    http_process.join()
+    udp_process.join()
