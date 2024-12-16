@@ -2,12 +2,14 @@ import multiprocessing
 import mimetypes
 import os
 import pathlib
+from datetime import datetime
 from functools import partial
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.parse
 import socket
 from dotenv import load_dotenv
 import logging
+from pymongo import MongoClient
 
 # Load environment variables from .env file
 load_dotenv()
@@ -16,6 +18,7 @@ load_dotenv()
 log_level = os.environ.get('LOG_LEVEL', 'DEBUG').upper()
 logging.basicConfig(level=getattr(logging, log_level, logging.DEBUG),
                     format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 class SocketWriter:
     def __init__(self, socket_ip, socket_port):
@@ -28,9 +31,20 @@ class SocketWriter:
     def write(self, data):
         self.socket_client.sendto(data, self.socket_server)
         logging.debug(f'Send data: {data.decode()} to socket: {self.socket_server}')
-        response, address = self.socket_client.recvfrom(1024)
-        logging.debug(f'HTTP Response data: {response.decode()} from address: {address}')
 
+class Storage:
+    def __init__(self, host, port, user, password, db_name, collection_name):
+        connection_string = f"mongodb://{user}:{password}@{host}:{port}/"
+        self.client = MongoClient(connection_string, serverSelectionTimeoutMS=5000)
+        self.db = self.client[db_name]
+        self.collection = self.db[collection_name]
+        logging.debug(f"Connected to MongoDB, Database: {db_name}, collection: {collection_name}")
+
+    def insert_one(self, data):
+        self.collection.insert_one(data)
+
+    def close(self):
+        self.client.close()
 
 
 class HttpHandler(BaseHTTPRequestHandler):
@@ -38,7 +52,6 @@ class HttpHandler(BaseHTTPRequestHandler):
         self.socket_writer = socket_writer
 
         super().__init__(*args, **kwargs)
-
 
     def do_GET(self):
         pr_url = urllib.parse.urlparse(self.path)
@@ -75,25 +88,54 @@ class HttpHandler(BaseHTTPRequestHandler):
         with open(f'.{self.path}', 'rb') as file:
             self.wfile.write(file.read())
 
+class UDPServer:
+    def __init__(self, ip, port, storage: Storage):
+        self.ip = ip
+        self.port = port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((self.ip, self.port))
+        self.storage = storage
+
+    def run(self):
+        while True:
+            data, address = self.sock.recvfrom(1024)
+            parsed_data = dict(urllib.parse.parse_qsl(urllib.parse.unquote_plus(data.decode())))
+            parsed_data["date"] = datetime.now()
+            logging.debug(f'Received data: {data.decode()} from: {address}')
+
+            try:
+                self.storage.insert_one(parsed_data)
+            except Exception as e:
+                logging.error(f'Failed write data into storage, data: {parsed_data}, error: {e}')
+            
+
+    def close(self):
+        self.sock.close()
+
 def run_udp_server(ip, port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    server = ip, port
-    sock.bind(server)
+    storage = Storage(
+        host=os.environ.get('MONGO_HOST', 'localhost'),
+        port=int(os.environ.get('MONGO_PORT', 27017)),
+        user=os.environ.get('MONGO_USER', 'user'),
+        password=os.environ.get('MONGO_PASS', 'password'),
+        db_name=os.environ.get('MONGO_DBNAME', 'test_db'),
+        collection_name=os.environ.get('MONGO_COLLECTION', 'test_collection')
+    )
+
+    udp_server = UDPServer(ip, port, storage)
+
     try:
         logging.debug(f"UDP server started on ip: {ip}, port: {port}")
-        while True:
-            data, address = sock.recvfrom(1024)
-            logging.debug(f'UDP Received data: {data.decode()} from: {address}')
-            sock.sendto(data, address)
-            logging.debug(f'UDP Send data: {data.decode()} to: {address}')
+        udp_server.run()
 
     except KeyboardInterrupt:
         logging.debug('Destroy UDP server')
     finally:
-        sock.close()
+        udp_server.close()
+        storage.close()
 
 
-def run_http_server(port, socket_ip, socket_port,):
+def run_http_server(port, socket_ip, socket_port, ):
     soket_writer = SocketWriter(socket_ip, socket_port)
 
     server_address = ('', port)
@@ -116,7 +158,7 @@ if __name__ == '__main__':
     http_port = int(os.environ.get('HTTP_PORT', 3000))
 
     http_process = multiprocessing.Process(target=run_http_server, args=(http_port, udp_ip, udp_port,))
-    udp_process = multiprocessing.Process(  target=run_udp_server, args=(udp_ip, udp_port,))
+    udp_process = multiprocessing.Process(target=run_udp_server, args=(udp_ip, udp_port,))
 
     http_process.start()
     udp_process.start()
